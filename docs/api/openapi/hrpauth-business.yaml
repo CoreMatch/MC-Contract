@@ -1945,6 +1945,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SdkCriticalOperationMeta'
+        contributions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SdkContributionMeta'
         dependencies:
           type: object
           additionalProperties:
@@ -1983,6 +1987,28 @@ components:
         path:
           type: string
           description: Must reference a route path
+    SdkContributionMeta:
+      type: object
+      required: [id, surface, module, label]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+          maxLength: 64
+          description: Contribution identifier, unique within the SDK package
+        surface:
+          type: string
+          enum: [register.providers]
+          description: Host extension surface consumed by the generated frontend
+        module:
+          type: string
+          description: In-package relative path to a module with a default React export
+        label:
+          type: string
+          description: Human-readable contribution label
+        priority:
+          type: integer
+          description: Optional display priority; higher values render first
     CoreMigrationUser:
       type: object
       required: [uid, uuid, email, username, present]
