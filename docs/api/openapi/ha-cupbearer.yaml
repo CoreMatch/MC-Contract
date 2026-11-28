@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: HA-Cupbearer API
-  version: 1.7.0
+  version: 1.10.0
   description: >
     Contract for the HA-Cupbearer HTTP surface. The service has three
     roles: (1) a read-only delivery service for the version manifest and
@@ -9,7 +9,13 @@ info:
     orchestrator that drives Tinyvisor on the target machine (config v2,
     `orchestration.enabled: true`), and (3) a first-run bootstrap layer that
     turns a fresh machine into a runnable platform without manual secret
-    generation, database creation or `.env` assembly (config v3).
+    generation, database creation or `.env` assembly (config v3), and (4) a
+    restricted deployment-directory discovery and confirmed import layer
+    (config v4). Discovery only scans explicitly configured deployment roots;
+    a root `deploy-manifest.yaml` may declare `discovery.depth` (1-8, default
+    1) so agents can describe nested layouts without operator configuration.
+    Confirmed imports become read-only `manual` or `aapanel` manifests under
+    Cupbearer state and never take over process or container lifecycle.
 
     Response envelope: every endpoint answers
     `{"success": bool, "message": string, "data": {...}}`; error bodies may
@@ -96,6 +102,24 @@ info:
     plaintext in the audit record). `database.existing_password` keeps its
     `policy: reuse` semantics unchanged; the hints are additive read-only
     fields carrying a `source` enum and a `provenance` description.
+
+    Since contract 1.10.0 a bare-metal Tinyvisor `deploy-manifest.yaml` may
+    declare ordered `hooks.after_file_update` actions (`shell` or `http`).
+    They run only after the artifact was actually replaced, or when a previous
+    hook attempt for that artifact did not complete; unchanged, successful
+    deployments do not repeat them. Actions run before `current` activation,
+    and any failure fails the deployment without switching the active version.
+    Earlier successful actions are not compensated automatically. Shell scripts
+    are relative to the manifest directory, receive a minimal environment, the release
+    directory and artifact metadata through `HA_*` environment variables, and
+    support per-action timeouts. Secrets remain `${secret:<name>}` references
+    resolved from the credentials file; shell arguments cannot carry secrets,
+    HTTP redirects are not followed, and recorded output is bounded and
+    redacted. The aggregated manifests view reports
+    `file_update_hook_count`, preflight validates scripts and secret references,
+    and run steps expose each action result. Foreign, container and plugin
+    projects never execute these hooks. The manifest section is modeled as
+    `components.schemas.DeployManifestHooks`.
 servers:
   - url: /
 
@@ -184,7 +208,8 @@ paths:
             `service_version`, `manager`, `source_path`, and since 1.5.0
             `artifact_source` — the declared `baremetal.artifact.source`
             (`local_path` | `ci_release` | `grail`), empty for external-kind
-            projects or when undeclared), `errors`.
+            projects or when undeclared), `file_update_hook_count` (ordered
+            post-artifact-update actions declared by the project), `errors`.
         '503':
           description: Orchestration disabled
 
@@ -224,8 +249,10 @@ paths:
         writability, `current` symlink shape, workdir, env-file existence
         and readability, Tinyvisor reachability + apiKey validity, target
         port occupancy (the project's own running process is skipped), disk
-        space against the artifact size, and declared dependency
-        reachability. Every finding carries the concrete path/port/address.
+        space against the artifact size, declared dependency reachability,
+        and `hooks.after_file_update` script paths / secret references (HTTP
+        hooks are not invoked during preflight). Every finding carries the
+        concrete path/port/address.
         Strictly read-only; not subject to single-flight (may run while a
         run is in progress). Query `projects` (comma-separated) and/or
         `group` to scope the check; empty means all projects.
@@ -272,6 +299,84 @@ paths:
           description: Run not found
         '503':
           description: Orchestration disabled
+
+  /api/v1/deploy/discovery:
+    get:
+      summary: Preview discovered deployment directories
+      description: >
+        Read-only discovery under `orchestration.deployment_roots`. A root
+        `deploy-manifest.yaml` may declare `discovery.depth` (1-8, default 1)
+        to control recursive scanning without operator configuration.
+        Correlates process working directories/executables, Tinyvisor scripts,
+        Compose labels and bounded loopback HTTP health probes. Service
+        manifests supply project, display name and health configuration.
+        Returns candidates, evidence, confidence and blockers; never returns
+        configuration contents or secrets. Container candidates remain visible
+        but are not importable in phase 1.
+      responses:
+        '200':
+          description: Discovery preview and non-fatal source warnings
+        '503':
+          description: Orchestration disabled
+
+  /api/v1/deploy/discovery/import:
+    post:
+      summary: Confirm and import discovered projects
+      description: >
+        Validates the configured root, manifest-declared discovery depth,
+        project name, read-only manager and health endpoint, then writes
+        manifests only to the imported-manifests state directory. Existing
+        repository and external manifests take precedence. With
+        `import_manifests: true`, discovers every direct or nested
+        `deploy-manifest.yaml` within the declared depth and imports all valid
+        `manual`/`aapanel` service manifests; unsafe or invalid manifests are
+        returned in `skipped`. This endpoint never modifies a discovered
+        service directory and never restarts a process or container.
+        Auth: X-Deploy-Token (fail-closed).
+      security:
+        - deployToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscoveryImportRequest'
+      responses:
+        '201':
+          description: Confirmed projects imported
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { const: true }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      imported:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            project: { type: string }
+                            source_path: { type: string }
+                      skipped:
+                        type: array
+                        description: Invalid or lifecycle-unsafe manifests omitted by a batch import.
+                        items:
+                          type: object
+                          required: [directory, reason]
+                          properties:
+                            directory: { type: string }
+                            project: { type: string }
+                            reason: { type: string }
+        '400':
+          description: Invalid selection, duplicate project/port, or unsafe directory
+        '401':
+          description: Invalid or missing X-Deploy-Token
+        '503':
+          description: Orchestration disabled or deploy token not configured
 
   /api/v1/deploy/run:
     post:
@@ -682,6 +787,96 @@ paths:
 
 components:
   schemas:
+    DeployManifestHooks:
+      type: object
+      description: Optional `hooks` section of a bare-metal Tinyvisor deploy manifest.
+      additionalProperties: false
+      properties:
+        after_file_update:
+          type: array
+          maxItems: 16
+          description: Ordered actions executed after an actual artifact replacement and before current activation.
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/ShellFileUpdateAction'
+              - $ref: '#/components/schemas/HTTPFileUpdateAction'
+            discriminator:
+              propertyName: type
+              mapping:
+                shell: '#/components/schemas/ShellFileUpdateAction'
+                http: '#/components/schemas/HTTPFileUpdateAction'
+    ShellFileUpdateAction:
+      type: object
+      additionalProperties: false
+      required: [type, script]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [shell] }
+        script:
+          type: string
+          description: Relative path inside the manifest directory; symlinks may not escape it.
+        args:
+          type: array
+          maxItems: 32
+          description: Literal arguments; secret references are forbidden to keep secrets out of process arguments.
+          items: { type: string }
+        env:
+          type: object
+          maxProperties: 32
+          description: Literal values or whole-value `${secret:<name>}` references. HA_* metadata names are reserved.
+          additionalProperties: { type: string }
+        timeout_seconds: { type: integer, minimum: 0, maximum: 300, default: 30 }
+    HTTPFileUpdateAction:
+      type: object
+      additionalProperties: false
+      required: [type, url]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [http] }
+        url:
+          type: string
+          format: uri
+          description: Absolute http/https URL without userinfo, fragment or secret references. Redirects are not followed.
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS], default: GET }
+        headers:
+          type: object
+          maxProperties: 32
+          description: Literal values or whole-value `${secret:<name>}` references.
+          additionalProperties: { type: string }
+        body: { type: string, description: 'Optional request body with inline ${secret:<name>} references.' }
+        content_type: { type: string, description: Defaults to application/json when body is non-empty. }
+        expect_status: { type: integer, minimum: 100, maximum: 599, default: 200 }
+        timeout_seconds: { type: integer, minimum: 0, maximum: 300, default: 30 }
+    DiscoveryImportRequest:
+      type: object
+      required: [root]
+      properties:
+        root:
+          type: string
+          description: Must exactly match a configured deployment root.
+        import_manifests:
+          type: boolean
+          description: >
+            When true, ignores `items` and imports every valid service
+            deploy-manifest.yaml found within the root manifest's declared
+            discovery.depth. Container, Tinyvisor-managed and invalid manifests
+            are skipped rather than taken over.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 256
+          description: Required when import_manifests is false or omitted.
+          items:
+            type: object
+            required: [directory, project, display_name, manager, port, health_path]
+            properties:
+              directory: { type: string }
+              project: { type: string, pattern: '^[a-z0-9][a-z0-9-]*$' }
+              display_name: { type: string }
+              manager: { type: string, enum: [manual, aapanel] }
+              port: { type: integer, minimum: 1, maximum: 65535 }
+              health_path: { type: string, pattern: '^/' }
+              health_status: { type: integer, minimum: 100, maximum: 599 }
     CredentialHint:
       type: object
       description: >
